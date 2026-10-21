@@ -1,0 +1,66 @@
+# Power Platform 認証パターンリファレンス
+
+## 前提: スクリプトは常に非対話で完走する
+
+新規に作成・実行するスクリプトは、**初回のデバイスコード認証がキャッシュ済みであること**を前提に、以降は認証の対話待ちが一切発生せず最後まで自動実行できるように書く。
+
+認証キャッシュ（`AuthenticationRecord`）は **`~/.power-platform-cli/auth_record.json`（ホームディレクトリ配下）にマシン全体で共有保存**される。そのため、このマシンで一度でもデバイスコード認証を完了していれば、別プロジェクト・別リポジトリのスクリプトからでもデバイスコード認証は不要になる。
+
+- 認証は必ず `auth_helper.py` 経由（`requests` 直呼び出し・MSAL 直接呼び出しは禁止）
+- スクリプト内でユーザーに認証情報の入力を求めるプロンプトを出さない
+- 実行時に対話待ちが発生した場合は、スクリプトの認証部分を疑い `auth_helper.py` の呼び出し方法を見直す（新しい認証フローを自作しない）
+- テナント・アカウントを切り替えたい場合のみ `~/.power-platform-cli/auth_record.json` を削除して再認証する
+
+```python
+from auth_helper import get_token, get_session, api_get, api_post, api_patch, api_delete, retry_metadata
+
+# Dataverse Web API 用トークン（デフォルトスコープ）
+token = get_token()
+
+# Flow API 用トークン（スコープ指定）
+token = get_token(scope="https://service.flow.microsoft.com/.default")
+
+# PowerApps API 用トークン（接続検索用）
+token = get_token(scope="https://service.powerapps.com/.default")
+
+# Bearer ヘッダー付き Session
+session = get_session()
+
+# Dataverse CRUD ヘルパー
+api_get("accounts?$top=1")
+api_post("accounts", {"name": "Test"}, solution="SolutionName")
+api_patch("accounts(id)", {"name": "Updated"})
+api_delete("accounts(id)")
+
+# メタデータ操作のリトライ（0x80040237, 0x80044363 対応）
+retry_metadata(lambda: api_post("EntityDefinitions", body), "テーブル作成")
+
+# Flow API ヘルパー
+from auth_helper import flow_api_call
+flow_api_call("GET", f"/providers/Microsoft.ProcessSimple/environments/{env_id}/flows")
+```
+
+#### 認証テスト
+
+```bash
+# 初回のみデバイスコード認証が走る。以降はサイレント。
+python -c "import sys; sys.path.insert(0, '.github/skills/standard/scripts'); from auth_helper import get_token; print(get_token()[:20] + '...')"
+```
+
+#### MSAL Python 3.14 互換性問題
+
+Python 3.14 では MSAL 内部トークンキャッシュ (`msal/token_cache.py`) が壊れる問題がある。
+
+**症状**: 初回 API コールは成功するが、2回目以降で `TypeError: sequence item 0: expected str instance, dict found` が発生。`target=" ".join(target)` で scopes が dict として格納されている。
+
+**対策** (`auth_helper.py` 実装済み):
+
+1. `_inmemory_tokens` dict でスコープ別にトークンをインメモリキャッシュ
+2. `credential.get_token()` は同じスコープで1回だけ呼び、結果をキャッシュ
+3. `TypeError` や `ClientAuthenticationError` 発生時は新しい credential を永続キャッシュなしで再構築
+4. `PP_NO_PERSISTENT_CACHE=1` 環境変数で OS 永続キャッシュを無効化可能
+
+```bash
+# Python 3.14 でキャッシュ破損が発生する場合
+$env:PP_NO_PERSISTENT_CACHE="1"; Remove-Item .auth_record.json -ErrorAction SilentlyContinue; python ./setup_dataverse.py
+```

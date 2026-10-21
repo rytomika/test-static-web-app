@@ -1,0 +1,11 @@
+[
+  {
+    "source_path": "C:\\SampleAppAgent\\spec\\input\\20260714_ TMI_調達ナレッジ資産化.pdf",
+    "relative_path": "20260714_ TMI_調達ナレッジ資産化.pdf",
+    "staging_markdown_path": "C:\\SampleAppAgent\\spec\\output\\staging\\20260714_ TMI_調達ナレッジ資産化.pdf.MD",
+    "source_sha256": "680f10326501792f08bf81fbff7de69afc14e6fe37a5ff5875c7600a62effc9b",
+    "processor": "anthropics/skills",
+    "is_completed": true,
+    "updated_at": "2026-07-14T04:21:25.387065+00:00"
+  }
+]

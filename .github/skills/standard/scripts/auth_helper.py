@@ -1,0 +1,677 @@
+"""
+Power Platform Dataverse デプロイスクリプト用 共通認証ヘルパーモジュール
+
+テーブル作成・フロー・Copilot Studio 等の Python デプロイスクリプトは
+このモジュールを使って認証する。
+※ Power Apps を利用するエンドユーザーの認証は Power Apps SDK が処理するため、
+  本モジュールの対象外。
+
+認証モード（優先順）:
+  1. PAC CLI プロファイル（.env に PAC_AUTH_PROFILE が設定されている場合）
+     - pac auth select → pac auth token でトークンを取得
+     - インタラクティブセットアップで pac auth create 済みの場合に自動利用
+     - デバイスコード認証が不要（インタラクティブ認証済みプロファイルを再利用）
+  2. DeviceCodeCredential（PAC CLI が未設定または失敗した場合のフォールバック）
+     - 2 層キャッシュ（AuthenticationRecord + MSAL 永続キャッシュ）
+     - 初回のみデバイスコード認証が走り、以後はサイレントリフレッシュ
+
+PAC CLI 認証の仕組み:
+  - PAC_AUTH_PROFILE に pac auth create で作成したプロファイル名を設定
+  - get_token() 呼び出し時に pac auth select → pac auth token を実行
+  - JWT の exp クレームから有効期限を取得してインメモリキャッシュで管理
+  - pac CLI が見つからない・失敗した場合は DeviceCode フローへ自動フォールバック
+
+DeviceCode 認証の仕組み（2 層キャッシュ・マシン全体で共有）:
+  1. AuthenticationRecord (~/.power-platform-cli/auth_record.json)
+     - アカウント情報（テナント・ユーザー等）を保存
+     - プロジェクトフォルダに依存しない固定パス（ホームディレクトリ配下）に保存するため、
+       同一マシン上の別プロジェクトからも再利用される
+     - これだけではトークンは保存されない
+  2. TokenCachePersistenceOptions (MSAL 永続トークンキャッシュ)
+     - リフレッシュトークン・アクセストークンをOS資格情報ストアに永続化（同一マシンで共有）
+     - AuthenticationRecord と組み合わせることでサイレントリフレッシュが可能
+
+動作:
+  - 初回（このマシンで最初の1回のみ）: DeviceCodeCredential でデバイスコード認証
+         → AuthenticationRecord をグローバルパスに保存
+         → MSAL トークンキャッシュにリフレッシュトークンを永続化
+  - 2回目以降（別プロジェクトでも）: AuthenticationRecord をロード
+         → MSAL キャッシュからリフレッシュトークンを取得
+         → サイレントリフレッシュ（デバイスコード不要）
+  - テナント/アカウントを切り替えたい場合のみ、~/.power-platform-cli/auth_record.json を
+    削除して再度デバイスコード認証を行う
+
+使い方:
+  from auth_helper import get_token, get_session, retry_metadata
+
+  # Dataverse Web API 用トークン
+  token = get_token()
+
+  # Flow API 用トークン
+  token = get_token(scope="https://service.flow.microsoft.com/.default")
+
+  # requests.Session（******
+  session = get_session()
+  resp = session.get(f"{DATAVERSE_URL}/api/data/v9.2/accounts")
+
+  # メタデータ操作のリトライ
+  retry_metadata(lambda: api_post("EntityDefinitions", body), "テーブル作成")
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import requests
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity import (
+    AuthenticationRecord,
+    DeviceCodeCredential,
+    TokenCachePersistenceOptions,
+)
+from dotenv import load_dotenv
+
+# ---------- 設定 ----------
+
+load_dotenv()
+
+TENANT_ID: str = os.getenv("TENANT_ID", "")
+DATAVERSE_URL: str = os.getenv("DATAVERSE_URL", "").rstrip("/")
+PAC_AUTH_PROFILE: str = os.getenv("PAC_AUTH_PROFILE", "")
+
+# AuthenticationRecord の保存先（マシン全体で共有・プロジェクトをまたいで再利用する）
+# ※ プロジェクトごとにディレクトリが変わると毎回デバイスコード認証が必要になるため、
+#   ホームディレクトリ配下の固定パスに保存する（PP_AUTH_RECORD_PATH で上書き可能）。
+_DEFAULT_AUTH_RECORD_PATH = Path.home() / ".power-platform-cli" / "auth_record.json"
+AUTH_RECORD_PATH: Path = Path(
+    os.environ.get("PP_AUTH_RECORD_PATH", str(_DEFAULT_AUTH_RECORD_PATH))
+).expanduser()
+
+# 旧バージョン（プロジェクトルート直下）との互換: グローバルキャッシュが無く、
+# 旧パスにレコードが残っている場合は自動移行する。
+_LEGACY_AUTH_RECORD_PATH = Path(__file__).resolve().parent / ".auth_record.json"
+if not AUTH_RECORD_PATH.exists() and _LEGACY_AUTH_RECORD_PATH.exists():
+    try:
+        AUTH_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTH_RECORD_PATH.write_text(
+            _LEGACY_AUTH_RECORD_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        print(
+            f"[auth_helper] 旧認証キャッシュをグローバルパスへ移行しました: {AUTH_RECORD_PATH}",
+            file=sys.stderr,
+        )
+    except OSError:
+        pass  # 移行失敗時は通常どおり新規デバイスコード認証にフォールバック
+
+# Dataverse Web API のデフォルトスコープ
+_DEFAULT_SCOPE = f"{DATAVERSE_URL}/.default" if DATAVERSE_URL else ""
+
+# ---------- 内部キャッシュ ----------
+
+_credential: DeviceCodeCredential | None = None
+
+
+def _device_code_callback(verification_uri: str, user_code: str, expires_on: object) -> None:
+    """デバイスコード認証のプロンプトを表示する。"""
+    print(
+        "\n========================================\n"
+        "  デバイスコード認証\n"
+        "========================================\n"
+        f"  1. ブラウザで {verification_uri} を開く\n"
+        f"  2. コード {user_code} を入力\n"
+        "========================================\n",
+        file=sys.stderr,
+    )
+
+
+def _build_credential() -> DeviceCodeCredential:
+    """DeviceCodeCredential を構築する（2 層キャッシュ付き）。
+
+    1. TokenCachePersistenceOptions — MSAL 永続トークンキャッシュ
+       リフレッシュトークン・アクセストークンを OS 資格情報ストアに保存。
+       AuthenticationRecord だけではトークンは保存されないため、
+       この設定が無いと毎回デバイスコード認証が必要になる。
+    2. AuthenticationRecord — アカウント情報キャッシュ
+       テナント・ユーザー情報を保存し、MSAL キャッシュから正しい
+       トークンエントリを検索するキーとして機能する。
+    """
+    # OS 永続トークンキャッシュが壊れることがあるため、
+    # 環境変数 PP_NO_PERSISTENT_CACHE=1 で無効化可能
+    use_persistent_cache = not os.environ.get("PP_NO_PERSISTENT_CACHE")
+
+    kwargs: dict = {
+        "tenant_id": TENANT_ID or None,
+        "prompt_callback": _device_code_callback,
+    }
+
+    if use_persistent_cache:
+        cache_options = TokenCachePersistenceOptions(
+            name="power_platform_token_cache_v3",
+            allow_unencrypted_storage=True,
+        )
+        kwargs["cache_persistence_options"] = cache_options
+
+    auth_record: AuthenticationRecord | None = None
+    if AUTH_RECORD_PATH.exists():
+        try:
+            serialized = AUTH_RECORD_PATH.read_text(encoding="utf-8")
+            auth_record = AuthenticationRecord.deserialize(serialized)
+            print(
+                f"[auth_helper] 認証キャッシュをロードしました: {AUTH_RECORD_PATH}",
+                file=sys.stderr,
+            )
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            print(
+                f"[auth_helper] 認証キャッシュの読み込みに失敗（初回認証に切り替え）: {exc}",
+                file=sys.stderr,
+            )
+
+    # None の値を除外（未設定パラメータはライブラリの既定値を使う）
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+    if auth_record is not None:
+        kwargs["authentication_record"] = auth_record
+
+    return DeviceCodeCredential(**kwargs)
+
+
+def _ensure_credential() -> DeviceCodeCredential:
+    """モジュールレベルのシングルトン credential を返す。"""
+    global _credential  # noqa: PLW0603
+    if _credential is None:
+        _credential = _build_credential()
+    return _credential
+
+
+def _save_auth_record(record: AuthenticationRecord) -> None:
+    """AuthenticationRecord をグローバルパスに永続化する（他プロジェクトからも再利用される）。"""
+    AUTH_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_RECORD_PATH.write_text(record.serialize(), encoding="utf-8")
+    print(
+        f"[auth_helper] 認証レコードを保存しました（マシン全体で共有）: {AUTH_RECORD_PATH}",
+        file=sys.stderr,
+    )
+
+
+
+# ---------- PAC CLI 認証ヘルパー ----------
+
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """JWT の exp クレームをUnix タイムスタンプ (float) として取得する（署名検証なし）。
+
+    PAC CLI が返すトークンは標準 JWT のため、ペイロードから有効期限を取得できる。
+    解析に失敗した場合は None を返す。
+    """
+    try:
+        import base64
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        # Base64url は padding なしのため補完する
+        padding = (4 - len(payload_b64) % 4) % 4
+        payload_b64 += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pac_get_token(scope: str) -> str | None:
+    """PAC CLI プロファイルを使ってアクセストークンを取得する。
+
+    PAC_AUTH_PROFILE が設定されており、pac CLI が PATH に存在する場合のみ機能する。
+    失敗した場合は None を返し、呼び出し元が DeviceCode フローへフォールバックする。
+
+    Args:
+        scope: OAuth2 スコープ（例: ``https://org.dynamics.com/.default``）。
+
+    Returns:
+        アクセストークン文字列、または None。
+    """
+    if not PAC_AUTH_PROFILE:
+        return None
+
+    # /.default サフィックスを除いたリソース URL（pac auth token --resource の引数）
+    resource = scope[: -len("/.default")] if scope.endswith("/.default") else scope
+
+    try:
+        # 指定プロファイルを選択（すでに選択済みでも副作用なし）
+        subprocess.run(
+            ["pac", "auth", "select", "--name", PAC_AUTH_PROFILE],
+            capture_output=True,
+            timeout=15,
+        )
+        # アクセストークンを取得
+        result = subprocess.run(
+            ["pac", "auth", "token", "--resource", resource],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip()
+            if token:
+                print(
+                    f"[auth_helper] PAC CLI プロファイル '{PAC_AUTH_PROFILE}' からトークンを取得しました",
+                    file=sys.stderr,
+                )
+                return token
+        # pac auth token が失敗した場合は stderr を表示してフォールバック
+        if result.stderr.strip():
+            print(
+                f"[auth_helper] pac auth token 失敗（DeviceCode フローにフォールバック）: "
+                f"{result.stderr.strip()}",
+                file=sys.stderr,
+            )
+    except FileNotFoundError:
+        print(
+            "[auth_helper] pac コマンドが見つかりません（DeviceCode フローにフォールバック）",
+            file=sys.stderr,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "[auth_helper] pac auth token タイムアウト（DeviceCode フローにフォールバック）",
+            file=sys.stderr,
+        )
+
+    return None
+
+
+# ---------- 公開 API ----------
+
+# Python 3.14 で MSAL 内部トークンキャッシュが壊れる問題の回避策:
+# 自前でスコープ別のインメモリキャッシュを管理する。
+# credential.get_token() は同じスコープで 1 回だけ呼び、結果をキャッシュする。
+_inmemory_tokens: dict[str, tuple[str, float]] = {}  # scope -> (token_str, expires_on)
+
+
+def get_token(scope: str | None = None) -> str:
+    """
+    指定スコープのアクセストークン文字列を返す。
+
+    初回はデバイスコード認証が走り、AuthenticationRecord が保存される。
+    2回目以降はインメモリキャッシュから取得する。
+
+    Args:
+        scope: OAuth2 スコープ。省略時は ``{DATAVERSE_URL}/.default``。
+
+    Returns:
+        Bearer トークン文字列。
+    """
+    if scope is None:
+        scope = _DEFAULT_SCOPE
+    if not scope:
+        raise ValueError(
+            "スコープが未指定です。DATAVERSE_URL を .env に設定するか scope 引数を渡してください。"
+        )
+
+    # インメモリキャッシュから返す（有効期限 60 秒前まで）
+    if scope in _inmemory_tokens:
+        token_str, expires_on = _inmemory_tokens[scope]
+        if time.time() < expires_on - 60:
+            return token_str
+
+    # PAC CLI プロファイルが設定されている場合は先に試みる
+    if PAC_AUTH_PROFILE:
+        pac_token = _pac_get_token(scope)
+        if pac_token:
+            expires_on = _decode_jwt_exp(pac_token) or (time.time() + 3000)
+            _inmemory_tokens[scope] = (pac_token, expires_on)
+            return pac_token
+
+    credential = _ensure_credential()
+
+    # キャッシュが存在しない場合は明示的に authenticate() を呼んで
+    # AuthenticationRecord を永続化してからトークンを取得する
+    if not AUTH_RECORD_PATH.exists():
+        record = credential.authenticate(scopes=[scope])
+        _save_auth_record(record)
+
+    try:
+        token = credential.get_token(scope)
+    except (ClientAuthenticationError, TypeError) as exc:
+        # MSAL 内部キャッシュ破損時のフォールバック:
+        # 新しい credential を永続キャッシュなしで構築し直す
+        print(
+            f"[auth_helper] MSAL キャッシュ破損を検出 — 再構築中: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        global _credential  # noqa: PLW0603
+        _credential = None
+        kwargs_nocache: dict = {
+            "tenant_id": TENANT_ID or None,
+            "prompt_callback": _device_code_callback,
+        }
+        kwargs_nocache = {k: v for k, v in kwargs_nocache.items() if v is not None}
+        # 認証レコードは使わない（内部キャッシュが壊れる原因になる）
+        _credential = DeviceCodeCredential(**kwargs_nocache)
+        record = _credential.authenticate(scopes=[scope])
+        _save_auth_record(record)
+        token = _credential.get_token(scope)
+
+    _inmemory_tokens[scope] = (token.token, token.expires_on)
+    return token.token
+
+
+def authenticate(scope: str | None = None) -> AuthenticationRecord:
+    """
+    明示的に対話認証を実行し、AuthenticationRecord を保存して返す。
+
+    通常は get_token() を呼ぶだけで十分だが、
+    スクリプトの冒頭で確実に認証を通したい場合にはこの関数を使う。
+
+    Args:
+        scope: OAuth2 スコープ。省略時は ``{DATAVERSE_URL}/.default``。
+
+    Returns:
+        AuthenticationRecord インスタンス。
+    """
+    if scope is None:
+        scope = _DEFAULT_SCOPE
+    if not scope:
+        raise ValueError(
+            "スコープが未指定です。DATAVERSE_URL を .env に設定するか scope 引数を渡してください。"
+        )
+
+    credential = _ensure_credential()
+    record = credential.authenticate(scopes=[scope])
+    _save_auth_record(record)
+    return record
+
+
+def get_session(scope: str | None = None) -> requests.Session:
+    """
+    Bearer トークンが設定された requests.Session を返す。
+
+    Args:
+        scope: OAuth2 スコープ。省略時は ``{DATAVERSE_URL}/.default``。
+
+    Returns:
+        Authorization ヘッダー付き requests.Session。
+    """
+    token = get_token(scope)
+    session = requests.Session()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "OData-MaxVersion": "4.0",
+            "OData-Version": "4.0",
+        }
+    )
+    return session
+
+
+# ---------- Dataverse ヘルパー ----------
+
+
+def api_get(path: str, scope: str | None = None) -> dict:
+    """Dataverse Web API に GET リクエストを送る。"""
+    url = f"{DATAVERSE_URL}/api/data/v9.2/{path.lstrip('/')}"
+    session = get_session(scope)
+    resp = session.get(url)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_post(path: str, body: dict, scope: str | None = None, *, solution: str = "") -> str | None:
+    """Dataverse Web API に POST リクエストを送る。作成されたレコードの ID を返す。"""
+    url = f"{DATAVERSE_URL}/api/data/v9.2/{path.lstrip('/')}"
+    session = get_session(scope)
+    if solution:
+        session.headers["MSCRM.SolutionName"] = solution
+    resp = session.post(url, json=body)
+    resp.raise_for_status()
+    odata_id = resp.headers.get("OData-EntityId", "")
+    if "(" in odata_id and ")" in odata_id:
+        return odata_id.split("(")[-1].rstrip(")")
+    return None
+
+
+def api_patch(path: str, body: dict, scope: str | None = None) -> None:
+    """Dataverse Web API に PATCH リクエストを送る。"""
+    url = f"{DATAVERSE_URL}/api/data/v9.2/{path.lstrip('/')}"
+    session = get_session(scope)
+    resp = session.patch(url, json=body)
+    resp.raise_for_status()
+
+
+def api_delete(path: str, scope: str | None = None) -> None:
+    """Dataverse Web API に DELETE リクエストを送る。"""
+    url = f"{DATAVERSE_URL}/api/data/v9.2/{path.lstrip('/')}"
+    session = get_session(scope)
+    resp = session.delete(url)
+    resp.raise_for_status()
+
+
+def api_request(path: str, body: dict, method: str = "PUT", scope: str | None = None) -> None:
+    """Dataverse Web API に任意のメソッドでリクエストを送る（PUT ローカライズ等）。"""
+    url = f"{DATAVERSE_URL}/api/data/v9.2/{path.lstrip('/')}"
+    session = get_session(scope)
+    session.headers["MSCRM.MergeLabels"] = "true"
+    resp = session.request(method, url, json=body)
+    resp.raise_for_status()
+
+
+# ---------- Flow API ヘルパー ----------
+
+
+FLOW_API = "https://api.flow.microsoft.com"
+FLOW_API_VERSION = "api-version=2016-11-01"
+
+POWERAPPS_API = "https://api.powerapps.com"
+
+
+def flow_api_call(
+    method: str,
+    path: str,
+    body: dict | None = None,
+) -> dict:
+    """
+    Flow Management API を呼び出す。
+
+    自動的に ``https://service.flow.microsoft.com/.default`` スコープで認証する。
+    """
+    token = get_token(scope="https://service.flow.microsoft.com/.default")
+    url = f"{FLOW_API}{path}"
+    separator = "&" if "?" in url else "?"
+    url = f"{url}{separator}{FLOW_API_VERSION}"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, url, headers=headers, json=body)
+    resp.raise_for_status()
+    if resp.status_code == 204 or not resp.text:
+        return {}
+    return resp.json()
+
+
+def powerapps_api_call(
+    method: str,
+    path: str,
+    params: dict | None = None,
+    body: dict | None = None,
+    timeout: int = 120,
+) -> dict:
+    """
+    PowerApps API を呼び出す。
+
+    自動的に ``https://service.powerapps.com/.default`` スコープで認証する。
+    """
+    token = get_token(scope="https://service.powerapps.com/.default")
+    url = f"{POWERAPPS_API}{path}"
+    if params is None:
+        params = {}
+    params.setdefault("api-version", "2016-11-01")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, url, headers=headers, params=params, json=body, timeout=timeout)
+    resp.raise_for_status()
+    if resp.status_code == 204 or not resp.text:
+        return {}
+    return resp.json()
+
+
+# ---------- Flow / PowerApps ユーティリティ ----------
+
+
+def resolve_environment_id() -> str:
+    """DATAVERSE_URL から環境 ID を逆引きする。"""
+    data = flow_api_call(
+        "GET",
+        "/providers/Microsoft.ProcessSimple/environments",
+    )
+    dv_url = DATAVERSE_URL.rstrip("/")
+    for env in data.get("value", []):
+        instance_url = (
+            env.get("properties", {})
+            .get("linkedEnvironmentMetadata", {})
+            .get("instanceUrl", "")
+            or ""
+        ).rstrip("/")
+        if instance_url == dv_url:
+            return env["name"]
+    raise RuntimeError(f"環境が見つかりません: {dv_url}")
+
+
+def find_connection(env_id: str, connector_name: str, display_name: str = "") -> str:
+    """環境内で Connected な接続 ID を検索する。見つからなければ sys.exit(1)。"""
+    import sys as _sys
+
+    label = display_name or connector_name
+    for attempt in range(3):
+        try:
+            data = powerapps_api_call(
+                "GET",
+                f"/providers/Microsoft.PowerApps/apis/{connector_name}/connections",
+                params={"$filter": f"environment eq '{env_id}'"},
+            )
+        except requests.exceptions.Timeout:
+            wait = 15 * (attempt + 1)
+            print(f"  ⚠ {label}: タイムアウト → {wait}s 待機してリトライ...")
+            time.sleep(wait)
+            continue
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 504:
+                wait = 15 * (attempt + 1)
+                print(f"  ⚠ {label}: 504 → {wait}s 待機してリトライ...")
+                time.sleep(wait)
+                continue
+            raise
+
+        for conn in data.get("value", []):
+            statuses = conn.get("properties", {}).get("statuses", [])
+            if any(s.get("status") == "Connected" for s in statuses):
+                return conn["name"]
+        break
+
+    print(f"  ❌ {label} ({connector_name}): Connected な接続が見つかりません")
+    print(f"     → https://make.powerautomate.com/connections で作成してください")
+    _sys.exit(1)
+
+
+# ---------- メタデータ操作リトライ ----------
+
+
+def _extract_error_detail(exc: Exception) -> str:
+    """例外からエラー詳細文字列を抽出する。
+
+    requests.HTTPError の場合はレスポンスボディに Dataverse のエラーコード
+    （0x80040237, 0x80044363 等）が含まれるため、str(e) ではなく
+    response.text から取得する必要がある。
+    """
+    parts = [str(exc)]
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        try:
+            parts.append(exc.response.text)
+        except Exception:  # noqa: BLE001 — response.text の読み取り失敗は無視
+            pass
+    return "\n".join(parts)
+
+
+def retry_metadata(
+    fn: Callable[[], object],
+    description: str,
+    max_attempts: int = 5,
+) -> object | None:
+    """メタデータ操作をリトライする。ロック競合時は累進的に待機。
+
+    Dataverse のメタデータ操作（テーブル作成、列追加、リレーションシップ等）は
+    排他ロックにより同時実行すると失敗する。このヘルパーは以下のエラーを検出して
+    自動リトライまたはスキップする。
+
+    | エラーコード / パターン         | 対処     | 説明                                 |
+    |-------------------------------|---------|--------------------------------------|
+    | ``already exists``            | スキップ | 既に存在する（べき等パターン）            |
+    | ``0x80040237``                | スキップ | メタデータ排他ロック競合（already exists系）|
+    | ``0x80044363``                | スキップ | ソリューション内に同名コンポーネント重複    |
+    | ``another ... running``       | リトライ | 別のメタデータ操作が実行中                |
+
+    Args:
+        fn: 実行する callable（引数なし）。
+        description: ログ用の操作説明文字列。
+        max_attempts: 最大リトライ回数（デフォルト 5）。
+
+    Returns:
+        fn() の戻り値。エラーをスキップした場合は None。
+    """
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            detail = _extract_error_detail(exc)
+            detail_lower = detail.lower()
+
+            # --- 既に存在する場合はスキップ ---
+            if (
+                "already exists" in detail_lower
+                or "0x80040237" in detail
+                or "0x80044363" in detail
+            ):
+                print(f"  {description}: already exists, skipping")
+                return None
+
+            # --- メタデータロック競合 → リトライ ---
+            if "another" in detail_lower and "running" in detail_lower:
+                wait = 10 * (attempt + 1)
+                print(
+                    f"  {description}: lock contention, waiting {wait}s "
+                    f"(attempt {attempt + 1}/{max_attempts})..."
+                )
+                time.sleep(wait)
+                continue
+
+            # --- 想定外のエラー → 再送出 ---
+            raise
+
+    print(f"  {description}: max retries ({max_attempts}) exceeded")
+    return None
+
+
+# ---------- CLI エントリーポイント ----------
+
+if __name__ == "__main__":
+    print("=== Power Platform 認証テスト ===")
+    if not DATAVERSE_URL:
+        print("DATAVERSE_URL が .env に設定されていません。", file=sys.stderr)
+        sys.exit(1)
+
+    record = authenticate()
+    print(f"認証成功: {record.username}")
+    print(f"テナント: {record.tenant_id}")
+    print(f"認証レコード保存先: {AUTH_RECORD_PATH}")
